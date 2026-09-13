@@ -4,7 +4,7 @@ const HTML_CONTENT = `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Card Tab - 我的导航</title>
+    <title>Card Tab - WZN</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2280%22>⭐</text></svg>">
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
@@ -2168,7 +2168,7 @@ const HTML_CONTENT = `
 
 const DEFAULT_USER = 'testUser';
 const DEFAULT_IMGAPI = 'https://api.xinac.net/icon/?url=';
-let USE_DEFAULT_IMGAPI = true;
+let USE_DEFAULT_IMGAPI = false; // 默认走自建 fetchBestIcon，避免把访问的站点（含私密链接域名）暴露给第三方
 
 function base64UrlEncode(str) {
     return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -2269,12 +2269,19 @@ function normalizeCategories(categories) {
     return categories;
 }
 
-const corsHeaders = {
-    'Access-Control-Allow-Origin': '*', 
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Cookie',
-    'Access-Control-Allow-Credentials': 'true' 
-};
+// 动态生成 CORS 响应头：回显请求的 Origin，而不是使用通配符 '*'。
+// 因为我们同时需要 Access-Control-Allow-Credentials: true（用于跨域携带 Cookie 刷新 token），
+// 浏览器规范不允许通配符源与 credentials 同时使用，因此改为按请求回显具体 Origin。
+function buildCorsHeaders(request) {
+    const origin = (request && request.headers && request.headers.get('Origin')) || '*';
+    return {
+        'Access-Control-Allow-Origin': origin,
+        'Vary': 'Origin',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, Cookie',
+        'Access-Control-Allow-Credentials': 'true'
+    };
+}
 
 async function fetchBestIcon(targetUrl) {
     const headers = {
@@ -2439,6 +2446,7 @@ async function handleSmartBackup(env, currentData) {
 export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
+        const corsHeaders = buildCorsHeaders(request);
 
         if (request.method === 'OPTIONS') {
             return new Response(null, { headers: corsHeaders });
@@ -2453,10 +2461,35 @@ export default {
         }
 
         if (url.pathname === '/api/login' && request.method === 'POST') {
+            // --- 登录失败限流：连续 5 次失败后锁定 15 分钟 ---
+            const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
+            const rateLimitKey = `login_fail_${clientIp}`;
+            const LOGIN_LOCK_WINDOW_MS = 15 * 60 * 1000;
+            const LOGIN_MAX_ATTEMPTS = 5;
+
+            let failInfo = null;
+            try {
+                failInfo = await env.CARD_ORDER.get(rateLimitKey, { type: 'json' });
+            } catch (e) {
+                failInfo = null;
+            }
+
+            const withinWindow = failInfo && (Date.now() - failInfo.lastTry < LOGIN_LOCK_WINDOW_MS);
+
+            if (withinWindow && failInfo.count >= LOGIN_MAX_ATTEMPTS) {
+                return new Response(JSON.stringify({ valid: false, error: '尝试次数过多，请15分钟后再试' }), {
+                    status: 429,
+                    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+                });
+            }
+
             try {
                 const { password } = await request.json();
                 if (password !== env.ADMIN_PASSWORD) throw new Error('Password mismatch');
-                
+
+                // 登录成功，清除失败记录
+                await env.CARD_ORDER.delete(rateLimitKey);
+
                 const currentTime = Math.floor(Date.now() / 1000);
 
                 const accessTokenPayload = { 
@@ -2487,6 +2520,16 @@ export default {
                 
                 return response;
             } catch (e) {
+                // 记录失败次数（15分钟内累计，超过窗口重新计数）
+                const newCount = withinWindow ? failInfo.count + 1 : 1;
+                try {
+                    await env.CARD_ORDER.put(rateLimitKey, JSON.stringify({ count: newCount, lastTry: Date.now() }), {
+                        expirationTtl: 900 // 15分钟自动过期
+                    });
+                } catch (putErr) {
+                    console.error('Failed to write login rate limit record:', putErr);
+                }
+
                 return new Response(JSON.stringify({ valid: false, error: 'Auth failed' }), { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
             }
         }
